@@ -88,7 +88,7 @@ mongoose
 const stopScheduler = startScheduledNotificationWorker(30 * 1000);(30 * 1000);
     // Start listening for requests
     server.listen(process.env.PORT || 8080, () => {
-      console.log(`Server is running on port ${process.env.PORT || 8080}`);
+      console.log(`Server is running on port${im not telling you}`);
     });
    const shutdown = async () => {
       console.log("Shutting down...");
