@@ -18,9 +18,10 @@ const NotificationSchema = new mongoose.Schema({
 
   channels: { type: [String], default: ["inapp"] },
 
+  // Targeting: departments are stored as plain strings (e.g. "Computer Science")
   target: {
     all: { type: Boolean, default: false },
-    departments: [{ type: mongoose.Schema.Types.ObjectId, ref: "Department" }],
+    departments: [{ type: String }], // <-- changed to String array
     levels: [{ type: Number }],
     roles: [{ type: String }],
     staffOnly: { type: Boolean, default: false },
@@ -43,7 +44,8 @@ const NotificationSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
+// useful indexes
 NotificationSchema.index({ "items.user": 1, createdAt: -1 });
-NotificationSchema.index({ scheduledAt: 1, status: 1 }); // index to help scheduler queries
+NotificationSchema.index({ scheduledAt: 1, status: 1 });
 
 export default mongoose.model("Notification", NotificationSchema);

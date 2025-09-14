@@ -1,34 +1,47 @@
 // controllers/notifications.js
-import Notification from "../model/Notification.js";
-import User from "../model/User.js";
+import Notification from "../models/Notification.js";
+import User from "../models/User.js";
 import { emitToUser, emitToRole } from "../config/socket.js";
 import mongoose from "mongoose";
 import { createError } from "../error.js";
 
 /**
  * Helper: build a Mongo query to resolve recipients based on target + sender rules
+ * department is a plain string on User, and target.departments is an array of strings.
  */
 const buildRecipientQuery = async ({ sender, senderRole, target = {} }) => {
   const q = { isActive: true };
 
+  // Roles logic
   if (Array.isArray(target.roles) && target.roles.length > 0) {
     q.role = { $in: target.roles };
   } else {
-    if (target.studentsOnly && !target.staffOnly) q.role = "student";
-    else if (target.staffOnly && !target.studentsOnly) q.role = { $in: ["lecturer", "hod", "levelAdviser", "dean", "subDean", "facultyOfficer", "admin"] };
+    if (target.studentsOnly && !target.staffOnly) {
+      q.role = "student";
+    } else if (target.staffOnly && !target.studentsOnly) {
+      q.role = { $in: ["lecturer", "hod", "levelAdviser", "dean", "subDean", "facultyOfficer", "admin"] };
+    } // else no explicit role filter (include everyone matching dept/level)
   }
 
+  // If target.all === true => don't filter by dept/level (respect studentsOnly/staffOnly)
   if (target.all) {
     return q;
   }
 
+  // Department filtering: target.departments is expected as array of strings
   if (Array.isArray(target.departments) && target.departments.length > 0) {
-    q.department = { $in: target.departments.map(id => mongoose.Types.ObjectId(id)) };
+    // match users whose department (string) is in the provided list
+    q.department = { $in: target.departments.map(d => String(d).trim()) };
   } else {
+    // default to sender.department for department-scoped roles
     const deptScoped = ["lecturer", "hod", "levelAdviser"];
-    if (deptScoped.includes(senderRole) && sender?.department) q.department = sender.department;
+    if (deptScoped.includes(senderRole) && sender?.department) {
+      q.department = sender.department;
+    }
+    // else: no department filter (means all departments)
   }
 
+  // Level filtering
   if (Array.isArray(target.levels) && target.levels.length > 0) {
     q.level = { $in: target.levels.map(Number) };
   }
@@ -38,34 +51,39 @@ const buildRecipientQuery = async ({ sender, senderRole, target = {} }) => {
 
 /**
  * Send a prepared Notification doc immediately (resolve recipients if needed)
- * This logic is used for immediate sends and scheduled sends.
  */
 export const sendNotificationNow = async (notification) => {
-  // If notification already has items, we assume recipients were pre-resolved (but we'll dedupe)
-  // If not, resolve using buildRecipientQuery with a "synthetic" sender
   let recipients = [];
 
-  // If items are present, map user ids to recipients
+  // If items present, resolve users from those ids
   if (Array.isArray(notification.items) && notification.items.length > 0) {
     const userIds = notification.items.map(it => it.user).filter(Boolean);
     recipients = await User.find({ _id: { $in: userIds } }).select("_id name email deviceTokens role department level").lean();
   } else {
-    // Need to resolve recipients from target using the sender info
-    const sender = await User.findById(notification.sender).select("_id department role name email").lean();
+    // resolve via target + sender
+    const sender = await User.findById(notification.sender).select("_id department role name email level").lean();
+    if (!sender) {
+      // mark failed
+      notification.status = "failed";
+      notification.meta = { lastError: "sender_not_found" };
+      await notification.save();
+      return { recipientsCount: 0, emittedSockets: 0 };
+    }
+
     const recipientQuery = await buildRecipientQuery({ sender, senderRole: notification.senderRole, target: notification.target || {} });
 
-    // Enforce studentsOnly/staffOnly again
+    // enforce studentsOnly/staffOnly
     if (notification.target?.studentsOnly) recipientQuery.role = "student";
     else if (notification.target?.staffOnly) recipientQuery.role = { $in: ["lecturer","hod","levelAdviser","dean","subDean","facultyOfficer","admin"] };
 
     recipients = await User.find(recipientQuery).select("_id name email deviceTokens role department level").lean();
 
-    // populate items in notification doc (for persistence)
+    // persist items for delivery/read-tracking
     notification.items = recipients.map(r => ({ user: r._id }));
     await notification.save();
   }
 
-  // de-duplicate recipients by id
+  // dedupe recipients
   const seen = new Set();
   recipients = recipients.filter(r => {
     const id = String(r._id);
@@ -74,7 +92,7 @@ export const sendNotificationNow = async (notification) => {
     return true;
   });
 
-  // emit to users
+  // emit to each online user
   let emittedSockets = 0;
   for (const r of recipients) {
     try {
@@ -91,7 +109,7 @@ export const sendNotificationNow = async (notification) => {
     }
   }
 
-  // Optionally: if target.roles specified emit to those roles
+  // optional: emit to role channels if requested
   if (Array.isArray(notification.target?.roles) && notification.target.roles.length > 0) {
     for (const role of notification.target.roles) {
       emittedSockets += emitToRole(role, "notification:new", {
@@ -103,7 +121,6 @@ export const sendNotificationNow = async (notification) => {
     }
   }
 
-  // Update notification meta and return stats
   notification.status = "completed";
   notification.deliveryCount = recipients.length;
   await notification.save();
@@ -112,8 +129,7 @@ export const sendNotificationNow = async (notification) => {
 };
 
 /**
- * Create notification endpoint (immediate or scheduled).
- * Accepts scheduledAt ISO timestamp to schedule send.
+ * Create notification endpoint (immediate or scheduled)
  */
 export const createNotification = async (req, res, next) => {
   try {
@@ -124,15 +140,16 @@ export const createNotification = async (req, res, next) => {
     const { title, content, html, channels = ["inapp"], target = {}, priority = "normal", meta = {}, scheduledAt } = req.body;
     if (!content) return next(createError(400, "Content required"));
 
+    // load sender (department is string)
     const sender = await User.findById(senderId).select("_id department role name email level").lean();
     if (!sender) return next(createError(400, "Sender not found"));
 
-    // LevelAdviser default level
+    // LevelAdviser default level behavior
     if (senderRole === "levelAdviser" && !target.levels && sender.level) {
       target.levels = [sender.level];
     }
 
-    // Default target behavior
+    // default target behaviour
     const staffRolesNoDeptAllowed = ["dean", "subDean", "admin"];
     if (!target || Object.keys(target).length === 0) {
       if (staffRolesNoDeptAllowed.includes(senderRole)) {
@@ -143,7 +160,7 @@ export const createNotification = async (req, res, next) => {
       }
     }
 
-    // Create Notification document
+    // create notification doc (target.departments expected as array of strings if passed)
     const notification = new Notification({
       sender: sender._id,
       senderRole,
@@ -160,12 +177,12 @@ export const createNotification = async (req, res, next) => {
 
     await notification.save();
 
-    // If scheduled, return scheduled metadata and do not send now
+    // scheduled -> don't send now
     if (scheduledAt) {
       return res.status(201).json({ message: "Notification scheduled", notificationId: notification._id, scheduledAt: notification.scheduledAt });
     }
 
-    // Immediate send: use helper
+    // send now
     const stats = await sendNotificationNow(notification);
     return res.status(201).json({ message: "Notification created & sent", notificationId: notification._id, stats });
   } catch (err) {
@@ -287,11 +304,10 @@ export const getNotificationById = async (req, res, next) => {
 /**
  * Admin/staff list notifications with filters
  * Query params:
- *  - department: departmentId (includes general notifications where target.all === true)
+ *  - department: departmentName (string)
  *  - level: single level or comma-separated levels
  *  - senderRole: filter by role of sender (hod/lecturer)
  *  - senderId: filter by specific sender
- *  - page, limit
  */
 export const listNotificationsAdmin = async (req, res, next) => {
   try {
@@ -309,24 +325,24 @@ export const listNotificationsAdmin = async (req, res, next) => {
 
     // Department filter logic: include notifications where
     // - target.all === true (general), OR
-    // - target.departments contains department, OR
+    // - target.departments contains department (string), OR
     // - sender belongs to that department (so their sends are included)
     if (department) {
-      const deptId = department;
-      // find senders in that department
-      const senders = await User.find({ department: deptId }).select("_id").lean();
+      const deptName = String(department).trim();
+      // find senders in that department (department is a string on User)
+      const senders = await User.find({ department: deptName }).select("_id").lean();
       const senderIds = senders.map(s => s._id);
 
       filter.$or = [
         { "target.all": true },
-        { "target.departments": mongoose.Types.ObjectId(deptId) },
+        { "target.departments": deptName },
         { sender: { $in: senderIds } }
       ];
     }
 
     // Level filter: include notifications targeted to those levels OR general
     if (level) {
-      const levels = String(level).split(",").map(Number);
+      const levels = String(level).split(",").map(v => Number(v));
       filter.$and = filter.$and || [];
       filter.$and.push({
         $or: [
@@ -339,7 +355,6 @@ export const listNotificationsAdmin = async (req, res, next) => {
     if (senderRole) filter.senderRole = senderRole;
     if (senderId) filter.sender = senderId;
 
-    // Count & fetch
     const [total, notifications] = await Promise.all([
       Notification.countDocuments(filter),
       Notification.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean()

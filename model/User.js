@@ -37,12 +37,18 @@ const UserSchema = new mongoose.Schema({
   level: { type: Number, enum: [100, 200, 300, 400, 500, 600], required: true, default: 100 },
 
   // Department/faculty relation (store id or string)
-  department: { type: mongoose.Schema.Types.ObjectId, ref: "Department", required: function() {
-    // department required for lecturers, HOD, levelAdviser, student and HOD
-    const rolesNeedingDept = ["student", "lecturer", "hod", "levelAdviser"];
-    return rolesNeedingDept.includes(this.role);
-  }},
-  faculty: { type: mongoose.Schema.Types.ObjectId, ref: "Faculty", required: false },
+// models/User.js (excerpt - replace the existing department field)
+  // Department/faculty relation (store id or string)
+  department: {
+    type: String,
+    trim: true,
+    required: function () {
+      // department required for lecturers, HOD, levelAdviser, student and HOD
+      const rolesNeedingDept = ["student", "lecturer", "hod", "levelAdviser"];
+      return rolesNeedingDept.includes(this.role);
+    }
+  },
+  faculty: { type: String, trim: true, required: false },
 
   // Password + google flags
   password: { type: String }, // not required for fromGoogle users
