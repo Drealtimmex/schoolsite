@@ -1,6 +1,6 @@
 // controllers/notifications.js
-import Notification from "../models/Notification.js";
-import User from "../models/User.js";
+import Notification from "../model/Notification.js";
+import User from "../model/User.js";
 import { emitToUser, emitToRole } from "../config/socket.js";
 import mongoose from "mongoose";
 import { createError } from "../error.js";
