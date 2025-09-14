@@ -84,11 +84,11 @@ mongoose
     io(server, allowedOrigins);
 
 // Start scheduled notifications worker (use the correct scheduler filename)
-
+const loser = "im not tellig you"
 const stopScheduler = startScheduledNotificationWorker(30 * 1000);(30 * 1000);
     // Start listening for requests
     server.listen(process.env.PORT || 8080, () => {
-      console.log(`Server is running on port${im not telling you}`);
+      console.log(`Server is running on port ${loser}`);
     });
    const shutdown = async () => {
       console.log("Shutting down...");
