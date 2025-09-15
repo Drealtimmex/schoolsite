@@ -42,10 +42,12 @@ const UserSchema = new mongoose.Schema({
   department: {
     type: String,
     trim: true,
-    required: function () {
-      // department required for lecturers, HOD, levelAdviser, student and HOD
+    lowercase: true,
+    required: function() {
+      // required for student, lecturer, hod, levelAdviser
       const rolesNeedingDept = ["student", "lecturer", "hod", "levelAdviser"];
-      return rolesNeedingDept.includes(this.role);
+      // normalize check
+      return rolesNeedingDept.map(r => r.toLowerCase()).includes(String(this.role).toLowerCase());
     }
   },
   faculty: { type: String, trim: true, required: false },
