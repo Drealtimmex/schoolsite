@@ -52,7 +52,7 @@ export const signUp = async (req, res, next) => {
     // normalize role string for comparisons
     const roleNorm = String(role).trim().toLowerCase();
 
-    const staffRoles = ["lecturer", "hod", "leveladviser", "dean", "subdean", "facultyofficer", "admin"];
+    const staffRoles = ["lecturer", "hod", "leveladviser","facualtyPRO", "dean", "subdean", "facultyofficer", "admin"];
     const isStaff = staffRoles.includes(roleNorm);
 
     // staff must provide email (except you can change this if needed)
