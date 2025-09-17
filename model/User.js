@@ -50,7 +50,8 @@ const UserSchema = new mongoose.Schema({
       return rolesNeedingDept.map(r => r.toLowerCase()).includes(String(this.role).toLowerCase());
     }
   },
-  faculty: { type: String, trim: true, required: false },
+  faculty: { type: String, trim: true,default:"FET", required: false },
+  
 
   // Password + google flags
   password: { type: String }, // not required for fromGoogle users
