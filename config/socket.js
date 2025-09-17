@@ -6,8 +6,6 @@ import User from "../model/User.js";
 
 /**
  * Map<userId, { role?: string, sockets: Set<socketId> }>
- * NOTE: in clustered setups this in-memory map won't be global across processes.
- * Use socket.io-redis adapter for multi-instance support.
  */
 export const connectedUsers = new Map();
 
@@ -23,37 +21,30 @@ export const io = (server, allowedOrigins = ["*"]) => {
       methods: ["GET", "POST", "PATCH", "DELETE", "PUT"],
       credentials: true
     },
-    // you can tune pingInterval / pingTimeout here
+    // adjust pingInterval / pingTimeout if needed
   });
+
+  // attach the instance to global for other modules that import emit helpers
+  global.io = io;
 
   /**
    * Socket handshake authentication
-   * - Accepts token from:
-   *    1) socket.handshake.auth.token  (recommended for mobile / JS clients)
-   *    2) cookie header 'access_token' (for browser flows using httpOnly cookie)
-   *    3) socket.handshake.headers.authorization (fallback)
-   *
-   * If no token or invalid token -> connection rejected.
    */
   io.use(async (socket, next) => {
     try {
-      // 1) token from auth (client: io(url, { auth: { token } }))
       let token = socket.handshake?.auth?.token;
 
-      // 2) fallback: cookie header (browser with httpOnly cookie)
       if (!token && socket.handshake?.headers?.cookie) {
         const cookies = cookie.parse(socket.handshake.headers.cookie || "");
         if (cookies.access_token) token = cookies.access_token;
       }
 
-      // 3) fallback: authorization header (Bearer ...)
       if (!token && socket.handshake?.headers?.authorization) {
         const h = socket.handshake.headers.authorization;
         if (typeof h === "string" && h.startsWith("Bearer ")) token = h.split(" ")[1].trim();
       }
 
       if (!token) {
-        // Option: allow anonymous connections by calling next();
         return next(new Error("Authentication error: token missing"));
       }
 
@@ -101,6 +92,14 @@ export const io = (server, allowedOrigins = ["*"]) => {
         entry.role = role;
       }
       entry.sockets.add(sid);
+
+      // JOIN user & role rooms — important for reliable emits and clustering adapters
+      try {
+        socket.join(`user:${uid}`);
+        socket.join(`role:${role}`);
+      } catch (err) {
+        console.warn(`[SOCKET] join room failed for ${sid}`, err);
+      }
     }
 
     // Send snapshot of online user ids (if you want)
@@ -126,11 +125,10 @@ export const io = (server, allowedOrigins = ["*"]) => {
       } else {
         console.log(`[SOCKET] user ${uid} still has ${entry.sockets.size} socket(s)`);
       }
+      // socket automatically leaves rooms on disconnect
     });
   });
 
-  // expose io instance globally if your code uses global.io
-  global.io = io;
   return io;
 };
 
@@ -138,6 +136,22 @@ export const io = (server, allowedOrigins = ["*"]) => {
 export const emitToUser = (userId, event, payload) => {
   const entry = connectedUsers.get(String(userId));
   if (!entry) return 0;
+
+  // Prefer room-based emit (works with adapters and is efficient)
+  if (global.io) {
+    try {
+      global.io.to(`user:${userId}`).emit(event, payload);
+      // return how many sockets we know this user has
+      return entry.sockets.size;
+    } catch (err) {
+      console.warn("emitToUser room emit failed, falling back to per-socket emit", err);
+    }
+  } else {
+    console.warn("emitToUser: global.io is not defined");
+    return 0;
+  }
+
+  // fallback (shouldn't run if room emit succeeded)
   let count = 0;
   for (const sid of entry.sockets) {
     try {
@@ -152,6 +166,25 @@ export const emitToUser = (userId, event, payload) => {
 
 /** Emit to all sockets of all users with a role. Returns number of sockets emitted to. */
 export const emitToRole = (role, event, payload) => {
+  // prefer room-based emit
+  if (global.io) {
+    try {
+      global.io.to(`role:${role}`).emit(event, payload);
+      // count sockets for bookkeeping
+      let count = 0;
+      for (const [, entry] of connectedUsers.entries()) {
+        if (entry.role === role) count += entry.sockets.size;
+      }
+      return count;
+    } catch (err) {
+      console.warn("emitToRole room emit failed, falling back to per-socket emit", err);
+    }
+  } else {
+    console.warn("emitToRole: global.io is not defined");
+    return 0;
+  }
+
+  // fallback (rare)
   let count = 0;
   for (const [uid, entry] of connectedUsers.entries()) {
     if (entry.role === role) {

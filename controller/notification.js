@@ -5,14 +5,9 @@ import { emitToUser, emitToRole } from "../config/socket.js";
 import mongoose from "mongoose";
 import { createError } from "../error.js";
 
-/**
- * Helper: build a Mongo query to resolve recipients based on target + sender rules
- * department is a plain string on User, and target.departments is an array of strings.
- */// controllers/notifications.js
-
 /** helper - normalize department strings */
 const normalizeDept = (d) => {
-  if (!d && d !== "") return d;
+  if (d === undefined || d === null) return d;
   return String(d).trim().toLowerCase();
 };
 
@@ -58,78 +53,156 @@ const buildRecipientQuery = async ({ sender, senderRole, target = {} }) => {
   return q;
 };
 
+/** helper - parse & validate scheduledAt: return Date if valid future date, else null */
+const parseValidScheduledAt = (raw) => {
+  if (!raw && raw !== 0) return null; // undefined/null/"" => treat as no schedule
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return null;
+  // require it be in the future (>= now + 1 second)
+  if (d.getTime() <= Date.now() + 1000) return null;
+  return d;
+};
+
 /**
  * sendNotificationNow - resolves recipients, emits to socket.io, and updates notification.
+ * Lots of logs added so you can inspect runtime behaviour.
  */
 export const sendNotificationNow = async (notification) => {
-  let recipients = [];
+  try {
+    const notifId = notification._id ?? notification.id ?? String(Math.random());
+    console.log('[sendNotificationNow] ENTER', notifId);
 
-  if (Array.isArray(notification.items) && notification.items.length > 0) {
-    const userIds = notification.items.map(it => it.user).filter(Boolean);
-    recipients = await User.find({ _id: { $in: userIds } }).select("_id name email deviceTokens role department level").lean();
-  } else {
-    const sender = await User.findById(notification.sender).select("_id department role name email level").lean();
-    if (!sender) {
-      notification.status = "failed";
-      notification.meta = { lastError: "sender_not_found" };
-      await notification.save();
-      return { recipientsCount: 0, emittedSockets: 0 };
+    let recipients = [];
+
+    // 1) explicit items -> resolve users
+    if (Array.isArray(notification.items) && notification.items.length > 0) {
+      const userIds = notification.items.map(it => it.user).filter(Boolean);
+      console.log('[sendNotificationNow] resolving recipients from explicit items, count=', userIds.length);
+      recipients = await User.find({ _id: { $in: userIds } }).select("_id name email deviceTokens role department level").lean();
+    } else {
+      // 2) target-based resolution
+      const sender = await User.findById(notification.sender).select("_id department role name email level").lean();
+      if (!sender) {
+        notification.status = "failed";
+        notification.meta = { lastError: "sender_not_found" };
+        await notification.save();
+        console.error('[sendNotificationNow] sender not found:', String(notification.sender));
+        return { recipientsCount: 0, emittedSockets: 0 };
+      }
+
+      const recipientQuery = await buildRecipientQuery({ sender, senderRole: notification.senderRole, target: notification.target || {} });
+
+      if (notification.target?.studentsOnly) recipientQuery.role = "student";
+      else if (notification.target?.staffOnly) recipientQuery.role = { $in: ["lecturer","hod","levelAdviser","dean","subDean","facultyOfficer","admin"] };
+
+      console.log('[sendNotificationNow] recipientQuery:', JSON.stringify(recipientQuery));
+      recipients = await User.find(recipientQuery).select("_id name email deviceTokens role department level").lean();
+
+      // persist items (so getMyNotifications works)
+      try {
+        notification.items = recipients.map(r => ({ user: r._id }));
+        await notification.save();
+      } catch (err) {
+        console.warn('[sendNotificationNow] warning: failed to persist items to notification (non-fatal)', err);
+      }
     }
 
-    const recipientQuery = await buildRecipientQuery({ sender, senderRole: notification.senderRole, target: notification.target || {} });
+    // dedupe recipients
+    const seen = new Set();
+    recipients = recipients.filter(r => {
+      const id = String(r._id);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
 
-    if (notification.target?.studentsOnly) recipientQuery.role = "student";
-    else if (notification.target?.staffOnly) recipientQuery.role = { $in: ["lecturer","hod","levelAdviser","dean","subDean","facultyOfficer","admin"] };
+    console.log('[sendNotificationNow] recipients resolved, count=', recipients.length, 'sample=', recipients.slice(0,5).map(r => String(r._id)));
 
-    recipients = await User.find(recipientQuery).select("_id name email deviceTokens role department level").lean();
+    // prepare createdAt (ISO)
+    const createdAtIso = (notification.createdAt && notification.createdAt.toISOString) ? notification.createdAt.toISOString() : new Date().toISOString();
 
-    // persist items
-    notification.items = recipients.map(r => ({ user: r._id }));
-    await notification.save();
-  }
+    // emit to each recipient using emitToUser (which should return number of sockets)
+    let emittedSockets = 0;
+    for (const r of recipients) {
+      try {
+        const payload = {
+          notificationId: notification._id,
+          title: notification.title,
+          content: notification.content,
+          from: { id: notification.sender, role: notification.senderRole },
+          createdAt: createdAtIso
+        };
 
-  // dedupe
-  const seen = new Set();
-  recipients = recipients.filter(r => {
-    const id = String(r._id);
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
+        console.log(`[sendNotificationNow] emitting -> user ${r._id} payload summary:`, { notificationId: payload.notificationId, title: payload.title, createdAt: payload.createdAt });
 
-  // emit
-  let emittedSockets = 0;
-  for (const r of recipients) {
+        const emitted = emitToUser(String(r._id), "notification:new", payload);
+        console.log(`[sendNotificationNow] emitToUser returned ${emitted} for user ${r._id}`);
+        emittedSockets += (Number(emitted) || 0);
+      } catch (err) {
+        console.error("emit error for user", r._id, err);
+      }
+    }
+
+    // emit to roles (if target.roles provided)
+    if (Array.isArray(notification.target?.roles) && notification.target.roles.length > 0) {
+      for (const role of notification.target.roles) {
+        try {
+          const payload = {
+            notificationId: notification._id,
+            title: notification.title,
+            content: notification.content,
+            from: { id: notification.sender, role: notification.senderRole },
+            createdAt: createdAtIso
+          };
+          console.log(`[sendNotificationNow] emitting to role ${role}`);
+          const emitted = emitToRole(role, "notification:new", payload);
+          console.log(`[sendNotificationNow] emitToRole returned ${emitted} for role ${role}`);
+          emittedSockets += (Number(emitted) || 0);
+        } catch (err) {
+          console.error("emit to role error", role, err);
+        }
+      }
+    }
+
+    console.log('[sendNotificationNow] emit summary -> recipients=', recipients.length, 'emittedSockets=', emittedSockets);
+
+    // Optionally update deliveredAt for persisted items (best-effort)
     try {
-      const payload = {
-        notificationId: notification._id,
-        title: notification.title,
-        content: notification.content,
-        from: { id: notification.sender, role: notification.senderRole },
-        createdAt: notification.createdAt
-      };
-      emittedSockets += emitToUser(String(r._id), "notification:new", payload);
+      if (recipients.length > 0) {
+        const recipientIds = recipients.map(r => r._id);
+        // Set deliveredAt on matched items using arrayFilters
+        await Notification.updateOne(
+          { _id: notification._id },
+          { $set: { "items.$[elem].deliveredAt": new Date() } },
+          { arrayFilters: [{ "elem.user": { $in: recipientIds } }], multi: false }
+        );
+        console.log('[sendNotificationNow] updated items.deliveredAt for matched recipients');
+      }
     } catch (err) {
-      console.error("emit error", err);
+      console.warn('[sendNotificationNow] warning: failed to update items.deliveredAt (non-fatal)', err);
     }
-  }
 
-  if (Array.isArray(notification.target?.roles) && notification.target.roles.length > 0) {
-    for (const role of notification.target.roles) {
-      emittedSockets += emitToRole(role, "notification:new", {
-        notificationId: notification._id,
-        title: notification.title,
-        content: notification.content,
-        from: { id: notification.sender, role: notification.senderRole }
-      });
+    // finalize notification record
+    notification.status = "completed";
+    notification.deliveryCount = recipients.length;
+    try {
+      await notification.save();
+    } catch (err) {
+      console.warn('[sendNotificationNow] warning: failed to save notification status/deliveryCount', err);
     }
+
+    return { recipientsCount: recipients.length, emittedSockets };
+  } catch (err) {
+    console.error('[sendNotificationNow] UNCAUGHT ERROR', err);
+    try {
+      notification.status = "failed";
+      notification.meta = { lastError: err.message || String(err) };
+      await notification.save();
+    } catch (saveErr) {
+      console.error('[sendNotificationNow] failed to set notification.status on error', saveErr);
+    }
+    return { recipientsCount: 0, emittedSockets: 0, error: String(err) };
   }
-
-  notification.status = "completed";
-  notification.deliveryCount = recipients.length;
-  await notification.save();
-
-  return { recipientsCount: recipients.length, emittedSockets };
 };
 
 /**
@@ -137,9 +210,14 @@ export const sendNotificationNow = async (notification) => {
  */
 export const createNotification = async (req, res, next) => {
   try {
+    console.log('>>> createNotification called, body=', req.body);
+
     const senderId = req.user?.id;
     const senderRoleFromToken = req.user?.role;
-    if (!senderId) return next(createError(401, "Unauthorized"));
+    if (!senderId) {
+      console.log('>>> createNotification: unauthorized (no senderId)');
+      return next(createError(401, "Unauthorized"));
+    }
 
     const { title, content, html, channels = ["inapp"], target = {}, priority = "normal", meta = {}, scheduledAt } = req.body;
     if (!content) return next(createError(400, "Content required"));
@@ -180,6 +258,12 @@ export const createNotification = async (req, res, next) => {
       target.departments = target.departments.map(d => normalizeDept(d)).filter(Boolean);
     }
 
+    // Validate scheduledAt: only accept a real future date
+    const scheduledDate = parseValidScheduledAt(scheduledAt);
+    if (scheduledAt && !scheduledDate) {
+      console.warn('createNotification: scheduledAt provided but invalid or not in future, treating as immediate:', scheduledAt);
+    }
+
     // Create notification document
     const notification = new Notification({
       sender: sender._id,
@@ -191,32 +275,28 @@ export const createNotification = async (req, res, next) => {
       target,
       priority,
       meta,
-      status: scheduledAt ? "scheduled" : "queued",
-      scheduledAt: scheduledAt ? new Date(scheduledAt) : undefined
+      status: scheduledDate ? "scheduled" : "queued",
+      scheduledAt: scheduledDate ? scheduledDate : undefined
     });
 
     await notification.save();
+    console.log('createNotification: notification saved', String(notification._id), 'scheduledAt=', notification.scheduledAt);
 
-    if (scheduledAt) {
+    if (scheduledDate) {
+      console.log('createNotification: scheduling notification for', scheduledDate.toISOString());
       return res.status(201).json({ message: "Notification scheduled", notificationId: notification._id, scheduledAt: notification.scheduledAt });
     }
 
+    console.log('createNotification: calling sendNotificationNow for', String(notification._id));
     const stats = await sendNotificationNow(notification);
+    console.log('createNotification: sendNotificationNow returned', stats);
+
     return res.status(201).json({ message: "Notification created & sent", notificationId: notification._id, stats });
   } catch (err) {
     console.error("createNotification error", err);
     next(err);
   }
 };
-
-/**
- * getMyNotifications, markAsRead, getNotificationById, listNotificationsAdmin
- * (reuse previous implementations but updated to department-as-string logic)
- */
-
-// For brevity, keep the remaining functions you already had (getMyNotifications, markAsRead, getNotificationById, listNotificationsAdmin)
-// just ensure any department comparisons / queries use normalized strings as above.
-
 
 /**
  * Get notifications for current user (paginated)
@@ -271,7 +351,7 @@ export const markAsRead = async (req, res, next) => {
       { $set: { "items.$.read": true, "items.$.deliveredAt": new Date() } }
     );
 
-    if (resu.matchedCount === 0) return next(createError(404, "Notification not found for user"));
+    if (resu.matchedCount === 0 && resu.nModified === 0) return next(createError(404, "Notification not found for user"));
 
     return res.status(200).json({ message: "Marked read" });
   } catch (err) {
@@ -330,11 +410,6 @@ export const getNotificationById = async (req, res, next) => {
 
 /**
  * Admin/staff list notifications with filters
- * Query params:
- *  - department: departmentName (string)
- *  - level: single level or comma-separated levels
- *  - senderRole: filter by role of sender (hod/lecturer)
- *  - senderId: filter by specific sender
  */
 export const listNotificationsAdmin = async (req, res, next) => {
   try {
@@ -350,13 +425,8 @@ export const listNotificationsAdmin = async (req, res, next) => {
     const { department, level, senderRole, senderId } = req.query;
     const filter = {};
 
-    // Department filter logic: include notifications where
-    // - target.all === true (general), OR
-    // - target.departments contains department (string), OR
-    // - sender belongs to that department (so their sends are included)
     if (department) {
       const deptName = String(department).trim();
-      // find senders in that department (department is a string on User)
       const senders = await User.find({ department: deptName }).select("_id").lean();
       const senderIds = senders.map(s => s._id);
 
@@ -367,7 +437,6 @@ export const listNotificationsAdmin = async (req, res, next) => {
       ];
     }
 
-    // Level filter: include notifications targeted to those levels OR general
     if (level) {
       const levels = String(level).split(",").map(v => Number(v));
       filter.$and = filter.$and || [];
