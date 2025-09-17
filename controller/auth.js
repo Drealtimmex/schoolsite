@@ -25,6 +25,13 @@ const createAccessToken = (payload, opts = { expiresIn: "30d" }) => {
 /**
  * signUp
  */
+// controllers/auth.js (imports expected at top of file)
+// import bcrypt from "bcryptjs/dist/bcrypt.js";
+// import jwt from "jsonwebtoken"; // if you implement createAccessToken yourself
+// import User from "../models/User.js";
+// import { createError } from "../error.js";
+// // cookieOpts() and createAccessToken() should already exist in this file
+
 export const signUp = async (req, res, next) => {
   try {
     const {
@@ -37,17 +44,22 @@ export const signUp = async (req, res, next) => {
       level = 100,
       department,
       faculty,
-      securityQuestions // optional: user can submit initial chosen questions+answers at signup
-    } = req.body;
+      securityQuestions // optional: user can submit chosen questions+answers at signup
+    } = req.body || {};
 
     if (!role) return next(createError(400, "Role is required"));
 
-    const staffRoles = ["lecturer", "hod", "levelAdviser", "dean", "subDean", "facultyOfficer", "admin"];
-    const isStaff = staffRoles.includes(role);
+    // normalize role string for comparisons
+    const roleNorm = String(role).trim().toLowerCase();
 
+    const staffRoles = ["lecturer", "hod", "leveladviser", "dean", "subdean", "facultyofficer", "admin"];
+    const isStaff = staffRoles.includes(roleNorm);
+
+    // staff must provide email (except you can change this if needed)
     if (isStaff && !email) return next(createError(400, "Email is required for staff accounts"));
 
-    if (role === "student") {
+    // Student validation (unchanged)
+    if (roleNorm === "student") {
       if (!level) return next(createError(400, "Level is required for student"));
       if (Number(level) === 100 && !matricNumber && !jambRegNumber) {
         return next(createError(400, "Level 100 students must provide jambRegNumber or matricNumber"));
@@ -57,37 +69,55 @@ export const signUp = async (req, res, next) => {
       }
     }
 
-    if (role === "lecturer" && !department) {
+    // Enforce department/level rules for specific staff roles:
+    // - levelAdviser: requires department AND level
+    // - lecturer: requires department
+    // - hod: requires department
+    // dean/subDean/facultyOfficer/admin do NOT require department
+    if (roleNorm === "leveladviser") {
+      if (!department) return next(createError(400, "Level adviser must provide a department"));
+      if (!level) return next(createError(400, "Level adviser must provide a level"));
+    }
+
+    if (roleNorm === "lecturer" && !department) {
       return next(createError(400, "Lecturers must set a department"));
     }
 
-    // hash password if provided
+    if (roleNorm === "hod" && !department) {
+      return next(createError(400, "HOD must set a department"));
+    }
+
+    // Hash password if provided
     let passwordHash = undefined;
     if (password) {
       const salt = bcrypt.genSaltSync(10);
       passwordHash = bcrypt.hashSync(password, salt);
     }
 
-    // if user provided chosen security questions on signup, hash answers
+    // Hash provided security questions (if given)
     const preparedSecurity = [];
     if (Array.isArray(securityQuestions)) {
       for (const sq of securityQuestions.slice(0, 2)) {
-        if (!sq.question || !sq.answer) continue;
+        if (!sq?.question || !sq?.answer) continue;
         const answerHash = bcrypt.hashSync(String(sq.answer).trim(), 10);
         preparedSecurity.push({ question: sq.question, answerHash });
       }
     }
 
+    // Normalize department & faculty to plain lowercase strings (if provided)
+    const deptNormalized = department ? String(department).trim().toLowerCase() : undefined;
+    const facultyNormalized = faculty ? String(faculty).trim().toLowerCase() : undefined;
+
     const newUser = new User({
       name,
-      email: email || undefined,
+      email: email ? String(email).toLowerCase() : undefined,
       password: passwordHash,
-      role,
+      role: roleNorm, // save normalized role
       matricNumber: matricNumber ? String(matricNumber).trim().toUpperCase() : undefined,
       jambRegNumber: jambRegNumber ? String(jambRegNumber).trim().toUpperCase() : undefined,
       level,
-      department,
-      faculty,
+      department: deptNormalized,
+      faculty: facultyNormalized,
       securityQuestions: preparedSecurity,
       fromGoogle: false,
       jambRegisteredAt: (!matricNumber && jambRegNumber) ? new Date() : undefined
@@ -99,16 +129,17 @@ export const signUp = async (req, res, next) => {
     const { password: _, securityQuestions: __, ...safe } = saved._doc;
 
     // Create token and set cookie + return token in JSON (useful for mobile)
-    const accessToken = createAccessToken({ id: saved._id, role: saved.role }, { expiresIn: "30d" });
-    res.cookie("access_token", accessToken, cookieOpts()).status(201).json({ user: safe, accessToken });
+ 
   } catch (err) {
-    if (err.code === 11000) {
+    // Duplicate key (unique) handling
+    if (err && err.code === 11000) {
       const dupKey = Object.keys(err.keyValue || {})[0];
       return next(createError(400, `${dupKey} already exists`));
     }
     next(err);
   }
 };
+
 
 /**
  * signIn
