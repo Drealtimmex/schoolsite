@@ -43,7 +43,6 @@ export const signUp = async (req, res, next) => {
       jambRegNumber,
       level = 100,
       department,
-      faculty,
       securityQuestions // optional: user can submit chosen questions+answers at signup
     } = req.body || {};
 
@@ -106,7 +105,7 @@ export const signUp = async (req, res, next) => {
 
     // Normalize department & faculty to plain lowercase strings (if provided)
     const deptNormalized = department ? String(department).trim().toLowerCase() : undefined;
-    const facultyNormalized = faculty ? String(faculty).trim().toLowerCase() : undefined;
+   
 
     const newUser = new User({
       name,
@@ -117,7 +116,6 @@ export const signUp = async (req, res, next) => {
       jambRegNumber: jambRegNumber ? String(jambRegNumber).trim().toUpperCase() : undefined,
       level,
       department: deptNormalized,
-      faculty: facultyNormalized,
       securityQuestions: preparedSecurity,
       fromGoogle: false,
       jambRegisteredAt: (!matricNumber && jambRegNumber) ? new Date() : undefined
@@ -129,7 +127,7 @@ export const signUp = async (req, res, next) => {
     const { password: _, securityQuestions: __, ...safe } = saved._doc;
 
     // Create token and set cookie + return token in JSON (useful for mobile)
- 
+     return res.status(201).json({ user: safe, });
   } catch (err) {
     // Duplicate key (unique) handling
     if (err && err.code === 11000) {
