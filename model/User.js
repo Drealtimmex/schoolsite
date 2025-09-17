@@ -34,7 +34,7 @@ const UserSchema = new mongoose.Schema({
   },
 
   // Student-specific metadata
-  level: { type: Number, enum: [100, 200, 300, 400, 500, 600], required: true, default: 100 },
+  level: { type: Number, enum: [100, 200, 300, 400, 500, 600], default: 100 },
 
   // Department/faculty relation (store id or string)
 // models/User.js (excerpt - replace the existing department field)
