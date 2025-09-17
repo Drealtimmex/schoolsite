@@ -189,6 +189,15 @@ export const deleteUser = async (req, res, next) => {
     next(err);
   }
 };
+export const getCurrentUser = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return next(createError(404, "User not found!"));
+    res.status(200).json(user);
+  } catch (err) {
+    next(err);
+  }
+};
 
 /**
  * Get single user (admin/staff or self)

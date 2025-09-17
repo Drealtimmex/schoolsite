@@ -6,6 +6,7 @@ import {
   deleteUser,
   getUserById,
   listUsers,
+  getCurrentUser
 } from "../controller/user.js";
 
 const router = express.Router();
@@ -20,7 +21,7 @@ const router = express.Router();
 router.post("/", verifyToken, requireRole([
   "lecturer","hod","levelAdviser","dean","subDean","facultyOfficer","admin"
 ]), createUser);
-
+router.get("/me", verifyToken, getCurrentUser);
 // Update user (self or staff/admin with rules inside controller)
 router.put("/:id", verifyToken, updateUser);
 
