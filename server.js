@@ -25,7 +25,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Recommended: read allowed origins from env or fallback to the list you used
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,https://service-xpress-frontend.vercel.app,https://fdd6a7d398fb.ngrok-free.app,https://service-xpress-frontend-kyrc.vercel.app,https://servicexpress-frontend.onrender.com")
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,https://b847cc67a274.ngrok-free.app,https://fdd6a7d398fb.ngrok-free.app,https://service-xpress-frontend-kyrc.vercel.app,https://servicexpress-frontend.onrender.com")
   .split(",")
   .map((s) => s.trim());
 
